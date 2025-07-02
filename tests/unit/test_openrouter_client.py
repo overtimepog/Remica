@@ -34,14 +34,18 @@ class TestOpenRouterClient:
     def test_client_initialization(self, mock_config):
         """Test client initialization"""
         with patch('src.ai.openrouter_client.OpenAI') as mock_openai:
-            client = OpenRouterClient()
-            
-            mock_openai.assert_called_once_with(
-                base_url="https://openrouter.ai/api/v1",
-                api_key="test-api-key"
-            )
-            assert client.usage_count == 0
-            assert client.session_start <= time.time()
+            with patch('src.ai.openrouter_client.httpx') as mock_httpx:
+                client = OpenRouterClient()
+                
+                # Check that OpenAI was called with the correct parameters
+                args, kwargs = mock_openai.call_args
+                assert kwargs['base_url'] == "https://openrouter.ai/api/v1"
+                assert kwargs['api_key'] == "test-api-key"
+                assert 'http_client' in kwargs  # Should have http_client for connection pooling
+                
+                assert client.usage_count == 0
+                assert client.session_start <= time.time()
+                assert hasattr(client, '_usage_lock')  # Should have thread lock
     
     def test_generate_response_success(self, client):
         """Test successful response generation"""
@@ -163,7 +167,7 @@ class TestOpenRouterClient:
         """Test successful connection test"""
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Connection successful"
+        mock_response.choices[0].message.content = "OK"  # The optimized client expects "OK" in response
         
         client.client.chat.completions.create = MagicMock(return_value=mock_response)
         
@@ -196,9 +200,11 @@ class TestOpenRouterClient:
         client.client.chat.completions.create.assert_called_with(
             model="meta-llama/llama-3.1-8b-instruct:free",
             messages=messages,
+            max_tokens=150,  # Default max_tokens
+            temperature=0.3,  # Default temperature  
             extra_headers={
                 "HTTP-Referer": "https://test-app.com",
                 "X-Title": "Test App"
             },
-            timeout=30
+            timeout=15.0  # Optimized client uses 15.0 timeout
         )

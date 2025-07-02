@@ -30,7 +30,7 @@ A sophisticated, containerized AI-powered chat agent that provides real-time rea
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/[your-username]/real-estate-chat-agent.git
+   git clone https://github.com/overtimepog/Remica.git
    cd real-estate-chat-agent
    ```
 

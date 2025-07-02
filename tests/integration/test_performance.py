@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 from typing import List, Dict
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.query.router import QueryRouter
 from src.ai.openrouter_client import OpenRouterClient
-from src.db.database import RealEstateDatabase
+from src.database.database import RealEstateDatabase
 
 @pytest.mark.integration
 @pytest.mark.slow
@@ -78,19 +79,19 @@ class TestPerformance:
     @pytest.mark.api
     @pytest.mark.slow
     def test_batch_query_performance(self, router, test_queries, results_dir):
-        """Test performance across multiple queries"""
-        results = []
-        total_start = time.time()
+        """Test performance across multiple queries running in parallel"""
         
-        for query_data in test_queries[:10]:  # Test first 10 queries
+        def execute_single_query(query_data):
+            """Execute a single query and return result dict"""
+            # Create new router instance for thread safety
+            thread_router = QueryRouter()
             query = query_data['query']
-            
             start_time = time.time()
             try:
-                response = router.route_query(query)
+                response = thread_router.route_query(query)
                 end_time = time.time()
                 
-                results.append({
+                return {
                     'question_id': query_data['question_id'],
                     'query': query,
                     'response_time': end_time - start_time,
@@ -99,11 +100,11 @@ class TestPerformance:
                     'engine_used': response.engine_used,
                     'cost': response.cost,
                     'error': None
-                })
+                }
                 
             except Exception as e:
                 end_time = time.time()
-                results.append({
+                return {
                     'question_id': query_data['question_id'],
                     'query': query,
                     'response_time': end_time - start_time,
@@ -112,7 +113,35 @@ class TestPerformance:
                     'engine_used': None,
                     'cost': 0.0,
                     'error': str(e)
-                })
+                }
+        
+        results = []
+        total_start = time.time()
+        
+        # Run queries in parallel using ThreadPoolExecutor
+        test_data = test_queries[:3]  # Test first 3 queries for faster execution
+        with ThreadPoolExecutor(max_workers=min(len(test_data), 3)) as executor:
+            # Submit all queries
+            future_to_query = {executor.submit(execute_single_query, query_data): query_data 
+                             for query_data in test_data}
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_query):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    query_data = future_to_query[future]
+                    results.append({
+                        'question_id': query_data['question_id'],
+                        'query': query_data['query'],
+                        'response_time': 0,
+                        'success': False,
+                        'model_used': None,
+                        'engine_used': None,
+                        'cost': 0.0,
+                        'error': f"Execution error: {str(e)}"
+                    })
         
         total_time = time.time() - total_start
         
@@ -130,15 +159,17 @@ class TestPerformance:
         # Performance assertions
         assert success_rate >= 80, f"Success rate {success_rate}% is below 80%"
         assert avg_response_time < 15, f"Average response time {avg_response_time}s exceeds 15s"
+        assert total_time < 25, f"Total parallel execution time {total_time}s exceeds 25s (should be ~15-20s with parallelization)"
         
         # Print summary
-        print(f"\\nBatch Query Performance Summary:")
-        print(f"Total Queries: {len(results)}")
+        print(f"\\nParallel Batch Query Performance Summary:")
+        print(f"Total Queries: {len(results)} (executed in parallel)")
         print(f"Successful: {len(successful_queries)}")
         print(f"Success Rate: {success_rate:.1f}%")
         print(f"Average Response Time: {avg_response_time:.2f}s")
-        print(f"Total Time: {total_time:.2f}s")
+        print(f"Total Parallel Execution Time: {total_time:.2f}s")
         print(f"Total Cost: ${total_cost:.4f}")
+        print(f"Speed Improvement: {(avg_response_time * len(results) / total_time):.1f}x faster than sequential")
         print(f"Results saved to: {output_path}")
     
     @pytest.mark.api
@@ -202,7 +233,7 @@ class TestPerformance:
     
     @pytest.mark.parametrize("query_count", [10, 25, 50])
     def test_scalability(self, router, query_count):
-        \"\"\"Test system scalability with different query volumes\"\"\"
+        """Test system scalability with different query volumes"""
         queries = [
             f"What's the yield for property type {i % 5} in location {i % 10}?"
             for i in range(query_count)

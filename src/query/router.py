@@ -1,8 +1,12 @@
 import re
+import time
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 from dataclasses import dataclass
+from functools import lru_cache
+import hashlib
+import json
 
 from ..ai.openrouter_client import OpenRouterClient, ModelResponse
 from ..database.database import RealEstateDatabase
@@ -32,68 +36,116 @@ class ParsedQuery:
     raw_query: str
 
 class QueryRouter:
-    """Routes queries to appropriate handlers"""
+    """Optimized router with caching and no double API calls"""
     
     def __init__(self):
         self.ai_client = OpenRouterClient()
         self.db = RealEstateDatabase()
+        self._response_cache = {}  # In-memory cache
+        self._cache_ttl = 3600  # 1 hour cache TTL
+        self._cache_hits = 0
+        self._cache_misses = 0
         
-        # Define query patterns
+        # Optimized patterns with higher specificity
         self.patterns = {
             QueryType.MARKET_YIELD: [
-                r"(?:what(?:'s| is) the )?(?:average )?yield.*(?:for|in|of)",
-                r"rental yield",
-                r"return on investment",
-                r"roi.*(?:for|in|of)"
+                r"(?:what(?:'s| is) the )?(?:average |gross |rental )?yield",
+                r"(?:rental |investment )?return",
+                r"roi\b",
+                r"cap(?:italization)? rate"
             ],
             QueryType.MARKET_TRENDS: [
-                r"market trend",
-                r"price (?:trend|movement|history)",
-                r"how (?:has|have).*(?:changed|moved|evolved)",
-                r"historical (?:data|prices|rents)"
+                r"(?:market |price |rental )?trends?",
+                r"(?:price |rent )(?:movement|history|change)",
+                r"how (?:has|have).*(?:market|price|rent)",
+                r"historical (?:data|price|rent)"
             ],
             QueryType.LOCATION_COMPARISON: [
-                r"compare.*(?:between|among)",
-                r"(?:which|what).*better.*(?:between|among)",
+                r"compare.*(?:to|with|vs|versus|between|and)",
+                r"(?:which|what).*better",
                 r"versus|vs\.?",
                 r"difference.*between"
             ],
             QueryType.INVESTMENT_OPPORTUNITIES: [
                 r"investment opportunit",
-                r"best (?:investments?|properties|deals)",
-                r"properties? (?:with|yielding|above)",
-                r"find.*(?:investment|properties)"
+                r"best (?:investment|propert|deal)",
+                r"(?:find|show|list).*(?:investment|propert)",
+                r"properties.*(?:yield|return).*(?:above|over|more than)"
             ],
             QueryType.MARKET_SUMMARY: [
-                r"market (?:summary|overview|analysis)",
+                r"market (?:summary|overview|analysis|report)",
                 r"tell me about.*market",
-                r"how is the.*market",
+                r"how is.*market",
                 r"market condition"
             ]
         }
         
-        # Common property types
-        self.property_types = [
-            "apartment", "house", "condo", "townhouse", 
-            "studio", "duplex", "villa", "penthouse"
-        ]
+        # Common locations with aliases
+        self.location_aliases = {
+            "sf": "san francisco",
+            "la": "los angeles",
+            "nyc": "new york",
+            "ny": "new york",
+            "chi": "chicago",
+            "dc": "washington"
+        }
         
-        # Common locations (would be loaded from database in production)
-        self.known_locations = [
-            "seattle", "portland", "san francisco", "los angeles",
-            "new york", "boston", "chicago", "austin", "denver",
-            "downtown", "suburbs", "waterfront", "city center"
-        ]
+        # Compile patterns for performance
+        self.compiled_patterns = {}
+        for query_type, patterns in self.patterns.items():
+            self.compiled_patterns[query_type] = [
+                re.compile(pattern, re.IGNORECASE) for pattern in patterns
+            ]
     
+    def _get_cache_key(self, query: str) -> str:
+        """Generate cache key for query"""
+        normalized = query.lower().strip()
+        return hashlib.md5(normalized.encode()).hexdigest()
+    
+    def _get_cached_response(self, query: str) -> Optional[ModelResponse]:
+        """Get cached response if available and not expired"""
+        cache_key = self._get_cache_key(query)
+        if cache_key in self._response_cache:
+            cached_data = self._response_cache[cache_key]
+            if time.time() - cached_data['timestamp'] < self._cache_ttl:
+                logger.info(f"Cache hit for query: {query[:50]}...")
+                self._cache_hits += 1
+                return cached_data['response']
+        self._cache_misses += 1
+        return None
+    
+    def _cache_response(self, query: str, response: ModelResponse):
+        """Cache response with timestamp"""
+        cache_key = self._get_cache_key(query)
+        self._response_cache[cache_key] = {
+            'response': response,
+            'timestamp': time.time()
+        }
+        
+        # Clean old cache entries if cache gets too large
+        if len(self._response_cache) > 1000:
+            self._clean_cache()
+    
+    def _clean_cache(self):
+        """Remove expired cache entries"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, data in self._response_cache.items()
+            if current_time - data['timestamp'] > self._cache_ttl
+        ]
+        for key in expired_keys:
+            del self._response_cache[key]
+    
+    @lru_cache(maxsize=1000)
     def parse_query(self, query: str) -> ParsedQuery:
-        """Parse user query to extract intent and entities"""
+        """Parse user query to extract intent and entities (cached)"""
         query_lower = query.lower()
         
-        # Determine query type
-        query_type = self._identify_query_type(query_lower)
+        # Determine query type using compiled patterns
+        query_type = self._identify_query_type_fast(query_lower)
         
         # Extract entities
-        locations = self._extract_locations(query_lower)
+        locations = self._extract_locations_fast(query_lower)
         property_type = self._extract_property_type(query_lower)
         bedrooms = self._extract_bedrooms(query_lower)
         price_range = self._extract_price_range(query_lower)
@@ -112,115 +164,154 @@ class QueryRouter:
         )
     
     def route_query(self, query: str) -> ModelResponse:
-        """Route query to appropriate handler"""
-        parsed = self.parse_query(query)
+        """Route query to appropriate handler with caching"""
+        # Check cache first
+        cached_response = self._get_cached_response(query)
+        if cached_response:
+            return cached_response
         
+        parsed = self.parse_query(query)
         logger.info(f"Routing query of type: {parsed.query_type}")
         
         try:
+            # Route to appropriate handler
             if parsed.query_type == QueryType.MARKET_YIELD:
-                return self._handle_market_yield(parsed)
+                response = self._handle_market_yield_optimized(parsed)
             elif parsed.query_type == QueryType.MARKET_TRENDS:
-                return self._handle_market_trends(parsed)
+                response = self._handle_market_trends_optimized(parsed)
             elif parsed.query_type == QueryType.LOCATION_COMPARISON:
-                return self._handle_location_comparison(parsed)
+                response = self._handle_location_comparison_optimized(parsed)
             elif parsed.query_type == QueryType.INVESTMENT_OPPORTUNITIES:
-                return self._handle_investment_opportunities(parsed)
+                response = self._handle_investment_opportunities_optimized(parsed)
             elif parsed.query_type == QueryType.MARKET_SUMMARY:
-                return self._handle_market_summary(parsed)
+                response = self._handle_market_summary_optimized(parsed)
             else:
-                return self._handle_general_question(parsed)
-                
+                response = self._handle_general_question_optimized(parsed)
+            
+            # Cache the response
+            self._cache_response(query, response)
+            return response
+            
         except Exception as e:
             logger.error(f"Error routing query: {str(e)}")
             return self._handle_error(str(e), parsed)
     
-    def _identify_query_type(self, query: str) -> QueryType:
-        """Identify the type of query"""
-        for query_type, patterns in self.patterns.items():
+    def _identify_query_type_fast(self, query: str) -> QueryType:
+        """Identify query type using compiled patterns (faster)"""
+        for query_type, patterns in self.compiled_patterns.items():
             for pattern in patterns:
-                if re.search(pattern, query, re.IGNORECASE):
+                if pattern.search(query):
                     return query_type
         return QueryType.GENERAL_QUESTION
     
-    def _extract_locations(self, query: str) -> List[str]:
-        """Extract location mentions from query"""
+    def _extract_locations_fast(self, query: str) -> List[str]:
+        """Extract locations with alias support"""
         locations = []
-        for location in self.known_locations:
-            if location in query:
+        words = query.split()
+        
+        # Check for aliases first
+        for word in words:
+            if word in self.location_aliases:
+                locations.append(self.location_aliases[word])
+        
+        # Common locations
+        known_locations = [
+            "seattle", "portland", "san francisco", "los angeles",
+            "new york", "boston", "chicago", "austin", "denver",
+            "miami", "atlanta", "dallas", "houston", "phoenix"
+        ]
+        
+        for location in known_locations:
+            if location in query and location not in locations:
                 locations.append(location)
+        
         return locations
     
     def _extract_property_type(self, query: str) -> Optional[str]:
         """Extract property type from query"""
-        for prop_type in self.property_types:
-            if prop_type in query:
-                return prop_type
+        # Check studio first since it's more specific than apartment
+        property_types = {
+            "studio": ["studio"],
+            "apartment": ["apartment", "apt", "flat"],
+            "house": ["house", "home", "single-family", "single family"],
+            "condo": ["condo", "condominium"],
+            "townhouse": ["townhouse", "townhome"],
+            "duplex": ["duplex"],
+            "villa": ["villa"],
+            "penthouse": ["penthouse"]
+        }
         
-        # Check for bedroom-based descriptions
-        if "1-bedroom" in query or "one bedroom" in query:
-            return "apartment"
-        elif "2-bedroom" in query or "two bedroom" in query:
+        for prop_type, keywords in property_types.items():
+            for keyword in keywords:
+                if keyword in query:
+                    return prop_type
+        
+        # Default based on bedroom count or generic "units"
+        if re.search(r"\d+[\s-]?(?:bedroom|br)", query) or \
+           re.search(r"(?:one|two|three|four|five)[\s-]?(?:bedroom|br)", query) or \
+           "units" in query:
             return "apartment"
         
         return None
     
     def _extract_bedrooms(self, query: str) -> Optional[int]:
-        """Extract number of bedrooms from query"""
-        patterns = [
-            (r"(\d+)[\s-]?bedroom", 1),
-            (r"(\d+)[\s-]?br", 1),
-            (r"(one|two|three|four|five)[\s-]?bedroom", None)
-        ]
+        """Extract number of bedrooms"""
+        # Numeric patterns
+        match = re.search(r"(\d+)[\s-]?(?:bedroom|br|bed)", query)
+        if match:
+            return int(match.group(1))
         
-        for pattern, group in patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                if group:
-                    return int(match.group(group))
-                else:
-                    # Convert word to number
-                    word = match.group(1).lower()
-                    word_to_num = {
-                        "one": 1, "two": 2, "three": 3, 
-                        "four": 4, "five": 5
-                    }
-                    return word_to_num.get(word)
+        # Word patterns
+        word_to_num = {
+            "studio": 0, "one": 1, "two": 2, "three": 3,
+            "four": 4, "five": 5, "six": 6
+        }
+        
+        for word, num in word_to_num.items():
+            if word in query and ("bedroom" in query or "br" in query):
+                return num
         
         return None
     
     def _extract_price_range(self, query: str) -> Optional[Tuple[float, float]]:
         """Extract price range from query"""
-        # Pattern for "under $X"
-        under_match = re.search(r"under\s*\$?([\d,]+)(?:k|K)?", query)
+        # Under pattern
+        under_match = re.search(r"under\s*\$?([\d,]+)(?:k|m)?", query, re.IGNORECASE)
         if under_match:
             value = float(under_match.group(1).replace(",", ""))
             if "k" in query.lower():
                 value *= 1000
+            elif "m" in query.lower():
+                value *= 1000000
             return (0, value)
         
-        # Pattern for "between $X and $Y"
+        # Between pattern
         between_match = re.search(
-            r"between\s*\$?([\d,]+)(?:k|K)?\s*and\s*\$?([\d,]+)(?:k|K)?", 
-            query, 
-            re.IGNORECASE
+            r"between\s*\$?([\d,]+)(?:k|m)?\s*(?:and|to)\s*\$?([\d,]+)(?:k|m)?",
+            query, re.IGNORECASE
         )
         if between_match:
             min_val = float(between_match.group(1).replace(",", ""))
             max_val = float(between_match.group(2).replace(",", ""))
-            if "k" in query.lower():
+            
+            # Handle k/m suffixes
+            if "k" in between_match.group(0).lower():
                 min_val *= 1000
                 max_val *= 1000
+            elif "m" in between_match.group(0).lower():
+                min_val *= 1000000
+                max_val *= 1000000
+                
             return (min_val, max_val)
         
         return None
     
     def _extract_yield_threshold(self, query: str) -> Optional[float]:
-        """Extract yield threshold from query"""
+        """Extract yield threshold"""
         patterns = [
             r"(?:yield|return|roi).*?(\d+(?:\.\d+)?)\s*%",
             r"(\d+(?:\.\d+)?)\s*%.*(?:yield|return|roi)",
-            r"above\s*(\d+(?:\.\d+)?)\s*%"
+            r"(?:above|over|more than)\s*(\d+(?:\.\d+)?)\s*%"
         ]
         
         for pattern in patterns:
@@ -231,27 +322,29 @@ class QueryRouter:
         return None
     
     def _extract_time_period(self, query: str) -> Optional[int]:
-        """Extract time period in months from query"""
+        """Extract time period in months"""
         patterns = [
-            (r"past\s*(\d+)\s*month", 1),
-            (r"last\s*(\d+)\s*month", 1),
-            (r"past\s*(\d+)\s*year", 12),
-            (r"last\s*(\d+)\s*year", 12),
-            (r"(\d+)\s*month", 1),
-            (r"(\d+)\s*year", 12)
+            (r"(?:past|last)\s*(\d+)\s*months?", 1),
+            (r"(?:past|last)\s*(\d+)\s*years?", 12),
+            (r"(?:past|last)\s*quarter", 3),
+            (r"(?:past|last)\s*year", 12)
         ]
         
         for pattern, multiplier in patterns:
             match = re.search(pattern, query, re.IGNORECASE)
             if match:
-                return int(match.group(1)) * multiplier
+                # If pattern has groups (contains parentheses for capture)
+                if match.groups():
+                    return int(match.group(1)) * multiplier
+                else:
+                    return multiplier
         
         return None
     
-    def _handle_market_yield(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle market yield queries"""
+    def _handle_market_yield_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle market yield queries with optimized prompts"""
         if not parsed.locations:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
         
         location = parsed.locations[0]
         property_type = parsed.property_type or "apartment"
@@ -259,23 +352,23 @@ class QueryRouter:
         # Get data from database
         data = self.db.get_market_yield(location, property_type, parsed.bedrooms)
         
-        # Format response
         if "error" not in data:
+            # Optimized prompt for concise response
             messages = [
-                {"role": "system", "content": "You are a real estate market analyst. Provide concise, data-driven insights."},
-                {"role": "user", "content": f"Based on this market data: {data}, provide a brief analysis of the rental yield for {property_type}s in {location}."}
+                {"role": "system", "content": "You are a concise real estate analyst. Provide brief, data-driven insights in 2-3 sentences max."},
+                {"role": "user", "content": f"Market data for {property_type}s in {location}: {data}. Give a brief yield analysis."}
             ]
             
             response = self.ai_client.generate_structured_response(messages, "market_yield")
             response.engine_used = "database_query"
             return response
         else:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
     
-    def _handle_market_trends(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle market trends queries"""
+    def _handle_market_trends_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle market trends with optimized prompts"""
         if not parsed.locations:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
         
         location = parsed.locations[0]
         months = parsed.time_period or 12
@@ -284,46 +377,51 @@ class QueryRouter:
         df = self.db.get_market_trends(location, months)
         
         if not df.empty:
-            # Prepare trend summary
-            trend_summary = df.groupby('property_type').agg({
-                'avg_price': ['mean', 'std'],
-                'avg_rent': ['mean', 'std'],
-                'transaction_count': 'sum'
-            }).to_dict()
+            # Calculate key metrics
+            avg_price_change = df['avg_price'].pct_change().mean() * 100
+            avg_rent_change = df['avg_rent'].pct_change().mean() * 100
+            
+            trend_data = {
+                "location": location,
+                "period": f"{months} months",
+                "price_change": f"{avg_price_change:+.1f}%",
+                "rent_change": f"{avg_rent_change:+.1f}%",
+                "transactions": len(df)
+            }
             
             messages = [
-                {"role": "system", "content": "You are a real estate market analyst. Analyze market trends and provide insights."},
-                {"role": "user", "content": f"Analyze these market trends for {location} over the past {months} months: {trend_summary}"}
+                {"role": "system", "content": "You are a concise market analyst. Summarize trends in 2-3 sentences."},
+                {"role": "user", "content": f"Market trends: {trend_data}. Brief analysis please."}
             ]
             
             response = self.ai_client.generate_structured_response(messages, "market_trends")
             response.engine_used = "database_query"
             return response
         else:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
     
-    def _handle_location_comparison(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle location comparison queries"""
+    def _handle_location_comparison_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle location comparison with optimized prompts"""
         if len(parsed.locations) < 2:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
         
         property_type = parsed.property_type or "apartment"
-        comparison_data = self.db.compare_locations(parsed.locations, property_type)
+        comparison_data = self.db.compare_locations(parsed.locations[:2], property_type)
         
         if comparison_data:
             messages = [
-                {"role": "system", "content": "You are a real estate market analyst. Compare markets objectively using data."},
-                {"role": "user", "content": f"Compare the real estate markets for {property_type}s across these locations: {comparison_data}"}
+                {"role": "system", "content": "You are a concise real estate analyst. Compare markets in 2-3 sentences focusing on key differences."},
+                {"role": "user", "content": f"Compare {property_type}s: {comparison_data}. Brief comparison please."}
             ]
             
             response = self.ai_client.generate_structured_response(messages, "location_comparison")
             response.engine_used = "database_query"
             return response
         else:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
     
-    def _handle_investment_opportunities(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle investment opportunity queries"""
+    def _handle_investment_opportunities_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle investment queries with optimized prompts"""
         min_yield = parsed.yield_threshold or 4.0
         max_price = parsed.price_range[1] if parsed.price_range else 1000000
         location = parsed.locations[0] if parsed.locations else None
@@ -331,41 +429,44 @@ class QueryRouter:
         opportunities = self.db.get_investment_opportunities(min_yield, max_price, location)
         
         if opportunities:
+            # Take top 3 opportunities
+            top_opportunities = opportunities[:3]
+            
             messages = [
-                {"role": "system", "content": "You are a real estate investment advisor. Highlight the best opportunities based on yield and value."},
-                {"role": "user", "content": f"Analyze these investment opportunities and recommend the top options: {opportunities[:5]}"}
+                {"role": "system", "content": "You are a concise investment advisor. Recommend top 3 properties in 3-4 sentences total."},
+                {"role": "user", "content": f"Top opportunities (yield>{min_yield}%): {top_opportunities}. Brief recommendation."}
             ]
             
             response = self.ai_client.generate_structured_response(messages, "investment_opportunities")
             response.engine_used = "database_query"
             return response
         else:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
     
-    def _handle_market_summary(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle market summary queries"""
+    def _handle_market_summary_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle market summary with optimized prompts"""
         if not parsed.locations:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
         
         location = parsed.locations[0]
         summary = self.db.get_market_summary(location)
         
         if summary:
             messages = [
-                {"role": "system", "content": "You are a real estate market analyst. Provide a comprehensive yet concise market overview."},
-                {"role": "user", "content": f"Provide a market summary for {location} based on this data: {summary}"}
+                {"role": "system", "content": "You are a concise market analyst. Provide a brief market overview in 3-4 sentences max."},
+                {"role": "user", "content": f"{location} market data: {summary}. Brief summary please."}
             ]
             
             response = self.ai_client.generate_structured_response(messages, "market_summary")
             response.engine_used = "database_query"
             return response
         else:
-            return self._handle_general_question(parsed)
+            return self._handle_general_question_optimized(parsed)
     
-    def _handle_general_question(self, parsed: ParsedQuery) -> ModelResponse:
-        """Handle general questions using AI"""
+    def _handle_general_question_optimized(self, parsed: ParsedQuery) -> ModelResponse:
+        """Handle general questions with optimized prompts"""
         messages = [
-            {"role": "system", "content": "You are a knowledgeable real estate market analyst. Provide helpful insights about real estate markets, investment strategies, and property analysis."},
+            {"role": "system", "content": "You are a concise real estate expert. Answer in 2-3 sentences max. Be direct and specific."},
             {"role": "user", "content": parsed.raw_query}
         ]
         
@@ -375,11 +476,10 @@ class QueryRouter:
     
     def _handle_error(self, error_msg: str, parsed: ParsedQuery) -> ModelResponse:
         """Handle errors gracefully"""
-        messages = [
-            {"role": "system", "content": "You are a helpful real estate assistant. Acknowledge the error and provide alternative suggestions."},
-            {"role": "user", "content": f"There was an error processing the query: '{parsed.raw_query}'. Error: {error_msg}. Please provide helpful alternatives or suggestions."}
-        ]
-        
-        response = self.ai_client.generate_structured_response(messages, "error_handling")
-        response.engine_used = "error_handler"
-        return response
+        return ModelResponse(
+            content=f"I encountered an issue processing your query. Please try rephrasing or ask a different question.",
+            model_used="error_handler",
+            response_time=0.0,
+            cost=0.0,
+            engine_used="error_handler"
+        )

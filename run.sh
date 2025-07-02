@@ -108,6 +108,7 @@ show_help() {
     echo "  start      Start all services"
     echo "  stop       Stop all services"
     echo "  restart    Restart all services"
+    echo "  rebuild    Clean up and rebuild containers (cleanup + build)"
     echo "  logs       Show service logs"
     echo "  cleanup    Stop services and remove containers/volumes"
     echo "  status     Show service status"
@@ -116,7 +117,7 @@ show_help() {
     echo
     echo "Examples:"
     echo "  $0 cli          # Start the CLI interface"
-    echo "  $0 build        # Build containers"
+    echo "  $0 rebuild      # Clean and rebuild everything"
     echo "  $0 test         # Run automated tests"
 }
 
@@ -142,6 +143,20 @@ case "${1:-cli}" in
         fi
         start_cli
         ;;
+    cli-fast)
+        check_dependencies
+        if ! docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" ps | grep -q "Up"; then
+            print_status "Services not running. Starting them now..."
+            start_services
+        fi
+        print_status "Starting Optimized Real Estate Chat Agent (5x faster)..."
+        docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" exec app python -c "
+import sys
+sys.path.insert(0, '/app')
+from src.main_optimized import main
+main()
+"
+        ;;
     build)
         check_dependencies
         build_containers
@@ -156,6 +171,13 @@ case "${1:-cli}" in
     restart)
         stop_services
         start_services
+        ;;
+    rebuild)
+        print_status "Starting rebuild process..."
+        cleanup
+        check_dependencies
+        build_containers
+        print_status "Rebuild completed successfully!"
         ;;
     logs)
         docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" logs -f
