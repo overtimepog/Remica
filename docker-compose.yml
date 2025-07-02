@@ -1,0 +1,56 @@
+# Docker Compose configuration for Real Estate Chat Agent
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: real-estate-chat-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DATABASE_HOST=db
+      - DATABASE_NAME=real_estate_db
+      - DATABASE_USER=postgres
+      - DATABASE_PASSWORD=postgres
+      - DATABASE_PORT=5432
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./test_data:/app/test_data
+      - ./test_results:/app/test_results
+      - ./logs:/app/logs
+    networks:
+      - real-estate-network
+    stdin_open: true
+    tty: true
+    command: tail -f /dev/null
+
+  db:
+    image: postgres:15-alpine
+    container_name: real-estate-db
+    environment:
+      - POSTGRES_DB=real_estate_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - real-estate-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  real-estate-network:
+    driver: bridge

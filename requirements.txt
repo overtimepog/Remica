@@ -1,0 +1,35 @@
+# Core dependencies
+openai
+psycopg2-binary
+pandas
+numpy
+click
+python-dotenv
+requests
+
+# Database and data handling
+SQLAlchemy
+alembic
+
+# Testing
+pytest
+pytest-cov
+pytest-asyncio
+pytest-mock
+
+# Development tools
+black
+flake8
+mypy
+isort
+
+# Utilities
+colorama
+tabulate
+tqdm
+pydantic
+
+# Logging and monitoring
+structlog
+python-json-logger
+rich
