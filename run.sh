@@ -113,12 +113,14 @@ show_help() {
     echo "  cleanup    Stop services and remove containers/volumes"
     echo "  status     Show service status"
     echo "  test       Run the test suite"
+    echo "  batch      Process questions from CSV file"
     echo "  help       Show this help message"
     echo
     echo "Examples:"
     echo "  $0 cli          # Start the CLI interface"
     echo "  $0 rebuild      # Clean and rebuild everything"
     echo "  $0 test         # Run automated tests"
+    echo "  $0 batch --input questions.csv --output results.csv"
 }
 
 # Check if .env file exists
@@ -195,6 +197,15 @@ main()
         fi
         print_status "Running test suite..."
         docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" exec app python -m pytest tests/ -v || print_warning "Some tests failed"
+        ;;
+    batch)
+        check_dependencies
+        if ! docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" ps | grep -q "Up"; then
+            start_services
+        fi
+        shift # Remove 'batch' from arguments
+        print_status "Running batch processor..."
+        docker-compose -f "$COMPOSE_FILE" -p "$PROJECT_NAME" exec app python -m src.batch_processor "$@"
         ;;
     help|--help|-h)
         show_help

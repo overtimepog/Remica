@@ -27,7 +27,7 @@ RUN useradd --create-home --shell /bin/bash app \
 USER app
 
 # Create necessary directories
-RUN mkdir -p /app/logs /app/test_results
+RUN mkdir -p /app/logs /app/test_results /app/data
 
 # Default command - use tail -f /dev/null to keep container running
 # The actual command will be overridden by docker-compose exec
